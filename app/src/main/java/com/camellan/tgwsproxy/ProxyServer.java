@@ -59,17 +59,26 @@ final class ProxyServer {
 
             WsClient ws=null;
             String key=dc+(media?"m":"");
+            String wsTarget = Domains.WS_IP.getOrDefault(dc, target);
             if(System.currentTimeMillis()>=dcCooldown.getOrDefault(key,0L)){
                 List<String> ds=Domains.wsDomains(dc,media);
                 Collections.shuffle(ds);
+
                 for(String domain:ds){
                     try{
-                        log.add("DC"+dc+(media?" media":"")+" -> "+domain+" via "+target);
-                        ws=WsClient.connect(target,domain,"/apiws",5000);
+                        log.add("DC"+dc+(media?" media":"")+" -> "+domain+" via "+wsTarget);
+
+                        ws = WsClient.connect(wsTarget, domain, "/apiws", 5000);
+
+                        log.add("WS READY DC"+dc+(media?" media":"")+" -> "+domain);
                         break;
-                    }catch(Exception e){log.add("WS "+domain+" failed: "+e.getMessage());}
+
+                    }catch(Exception e){
+                        log.add("WS "+domain+" failed: "+e.getMessage());
+                    }
                 }
             }
+
             if(ws!=null){
                 ws.sendBinary(relay);
                 bridge(c,ws,crypto);
@@ -109,7 +118,6 @@ final class ProxyServer {
                 byte[] b=new byte[65536];int n;
                 while(!stop.get()&&(n=ci.read(b))!=-1){
                     byte[] p=Arrays.copyOf(b,n);
-                    x.clientDec.update(p); // consume client cipher stream
                     byte[] relay=x.relayEnc.update(x.clientDec.update(p));
                     w.sendBinary(relay);
                 }

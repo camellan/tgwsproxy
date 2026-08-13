@@ -21,6 +21,7 @@ final class WsClient implements Closeable {
         Socket raw=new Socket();
         raw.connect(new InetSocketAddress(ip,443),timeout);
         raw.setTcpNoDelay(true);
+        raw.setSoTimeout(0);
         SSLContext ctx=SSLContext.getInstance("TLS");
         ctx.init(null,null,new SecureRandom());
         SSLSocket s=(SSLSocket)ctx.getSocketFactory().createSocket(raw,host,443,true);
@@ -32,18 +33,57 @@ final class WsClient implements Closeable {
         s.startHandshake();
 
         String key=Base64.getEncoder().encodeToString(Hex.random(16));
-        String req="GET "+path+" HTTP/1.1\r\n"+
-                "Host: "+host+"\r\n"+
-                "Upgrade: websocket\r\nConnection: Upgrade\r\n"+
-                "Sec-WebSocket-Key: "+key+"\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+        String req=
+                "GET "+path+" HTTP/1.1\r\n"+
+                        "Host: "+host+"\r\n"+
+                        "Upgrade: websocket\r\n"+
+                        "Connection: Upgrade\r\n"+
+                        "Sec-WebSocket-Key: "+key+"\r\n"+
+                        "Sec-WebSocket-Version: 13\r\n"+
+                        "Sec-WebSocket-Protocol: binary\r\n"+
+                        "\r\n";
+
         s.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
         s.getOutputStream().flush();
 
-        BufferedInputStream bin=new BufferedInputStream(s.getInputStream(), 8192);
+        BufferedInputStream bin=
+                new BufferedInputStream(s.getInputStream(),8192);
+
         String status=readLine(bin);
-        if(status==null || !status.startsWith("HTTP/1.1 101")) throw new IOException("WS handshake: "+status);
-        while(true){String l=readLine(bin); if(l==null)throw new EOFException(); if(l.isEmpty())break;}
-        return new WsClient(s, bin);
+
+        if(status==null)
+            throw new EOFException("WS handshake: EOF");
+
+        if(!status.startsWith("HTTP/1.1 101"))
+            throw new IOException("WS handshake: "+status);
+        System.out.println("WS 101: " + host + path);
+        System.out.println("WS READY: " + host + path);
+
+        boolean binaryProtocol=false;
+
+        while(true){
+            String l=readLine(bin);
+
+            if(l==null)
+                throw new EOFException("WS handshake: EOF");
+
+            if(l.isEmpty())
+                break;
+
+            if(l.regionMatches(true,0,
+                    "Sec-WebSocket-Protocol:",0,
+                    "Sec-WebSocket-Protocol:".length())){
+
+                if(l.toLowerCase(Locale.US).contains("binary"))
+                    binaryProtocol=true;
+            }
+        }
+
+        if(!binaryProtocol)
+            throw new IOException("WS handshake: server did not select binary protocol");
+        s.setSoTimeout(0);
+        return new WsClient(s,bin);
     }
 
     void sendBinary(byte[] data)throws Exception{

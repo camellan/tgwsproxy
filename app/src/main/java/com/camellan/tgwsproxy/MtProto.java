@@ -63,14 +63,20 @@ final class MtProto {
 
 
     static CryptoPair crypto(byte[] clientPreIv, byte[] secret, byte[] relayInit) throws Exception {
-        byte[] ckey=sha256(concat(Arrays.copyOfRange(clientPreIv,0,32),secret));
+        byte[] ckey=sha256(
+                concat(Arrays.copyOfRange(clientPreIv,0,32),secret)
+        );
         byte[] civ=Arrays.copyOfRange(clientPreIv,32,48);
+
         byte[] rev=reverse(clientPreIv);
-        byte[] ekey=sha256(concat(Arrays.copyOfRange(rev,0,32),secret));
+        byte[] ekey=sha256(
+                concat(Arrays.copyOfRange(rev,0,32),secret)
+        );
         byte[] eiv=Arrays.copyOfRange(rev,32,48);
 
         byte[] rkey=Arrays.copyOfRange(relayInit,8,40);
         byte[] riv=Arrays.copyOfRange(relayInit,40,56);
+
         byte[] rrev=reverse(Arrays.copyOfRange(relayInit,8,56));
         byte[] rdkey=Arrays.copyOfRange(rrev,0,32);
         byte[] rdiv=Arrays.copyOfRange(rrev,32,48);
@@ -79,7 +85,7 @@ final class MtProto {
         AesCtr ce=new AesCtr(ekey,eiv);
         AesCtr re=new AesCtr(rkey,riv);
         AesCtr rd=new AesCtr(rdkey,rdiv);
-        cd.update(new byte[64]); re.update(new byte[64]);
+
         return new CryptoPair(cd,ce,re,rd);
     }
 

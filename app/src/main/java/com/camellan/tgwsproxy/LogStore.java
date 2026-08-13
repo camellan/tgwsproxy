@@ -11,5 +11,15 @@ final class LogStore {
         if(n.length()>50000)n=n.substring(n.length()-50000);
         c.getSharedPreferences("logs",0).edit().putString("x",n).apply();
     }
-    static synchronized String get(Context c){return c.getSharedPreferences("logs",0).getString("x","");}
+
+    static synchronized String get(Context c){
+        return c.getSharedPreferences("logs",0).getString("x","");
+    }
+
+    static synchronized void clear(Context c){
+        c.getSharedPreferences("logs",0)
+                .edit()
+                .remove("x")
+                .apply();
+    }
 }

@@ -12,7 +12,7 @@ public class MainActivity extends Activity {
     ProxyConfig cfg;
     EditText secret,port;
     TextView status,logs;
-    Button start,stop,copy;
+    Button start,stop,copy,clearLog;
 
     @Override public void onCreate(Bundle b){
         super.onCreate(b);cfg=new ProxyConfig(this);
@@ -30,7 +30,15 @@ public class MainActivity extends Activity {
         stop=new Button(this);stop.setText("Остановить");
         copy=new Button(this);copy.setText("Скопировать tg://");
         row.addView(start,new LinearLayout.LayoutParams(0,-2,1));row.addView(stop,new LinearLayout.LayoutParams(0,-2,1));root.addView(row);
-        root.addView(copy);
+        LinearLayout logRow=new LinearLayout(this);
+
+        clearLog=new Button(this);
+        clearLog.setText("Очистить лог");
+
+        logRow.addView(copy,new LinearLayout.LayoutParams(0,-2,1));
+        logRow.addView(clearLog,new LinearLayout.LayoutParams(0,-2,1));
+
+        root.addView(logRow);
 
         logs=new TextView(this);logs.setTextSize(11);ScrollView sv=new ScrollView(this);sv.addView(logs);root.addView(sv,new LinearLayout.LayoutParams(-1,0,1));
         setContentView(root);
@@ -42,6 +50,12 @@ public class MainActivity extends Activity {
             String link="tg://proxy?server="+host+"&port="+cfg.port()+"&secret=dd"+cfg.secret();
             ((android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("tg proxy",link));
             Toast.makeText(this,"Ссылка скопирована",Toast.LENGTH_SHORT).show();
+        });
+
+        clearLog.setOnClickListener(v->{
+            LogStore.clear(this);
+            logs.setText("");
+            Toast.makeText(this,"Лог очищен",Toast.LENGTH_SHORT).show();
         });
         refresh();
     }
