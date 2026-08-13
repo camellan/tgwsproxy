@@ -118,7 +118,8 @@ final class ProxyServer {
                 byte[] b=new byte[65536];int n;
                 while(!stop.get()&&(n=ci.read(b))!=-1){
                     byte[] p=Arrays.copyOf(b,n);
-                    byte[] relay=x.relayEnc.update(x.clientDec.update(p));
+                    byte[] decrypted=x.clientDec.update(p);
+                    byte[] relay=x.relayEnc.update(decrypted);
                     w.sendBinary(relay);
                 }
             }catch(Exception ignored){}finally{stop.set(true);}
