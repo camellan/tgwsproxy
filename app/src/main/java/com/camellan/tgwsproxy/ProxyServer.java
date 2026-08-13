@@ -2,181 +2,244 @@ package com.camellan.tgwsproxy;
 
 import java.io.*;
 import java.net.*;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class ProxyServer {
     interface Log { void add(String s); }
-    private final ProxyConfig cfg; private final Log log;
-    private final ExecutorService exec=Executors.newCachedThreadPool();
-    private final AtomicBoolean running=new AtomicBoolean();
+
+    private static final long WS_FAIL_COOLDOWN_MS = 30_000L;
+    private static final long DC_FAIL_COOLDOWN_MS = 5_000L;
+    private static final int CONNECT_TIMEOUT_MS = 5_000;
+
+    private final ProxyConfig cfg;
+    private final Log log;
+    private final ExecutorService exec = Executors.newCachedThreadPool();
+    private final AtomicBoolean running = new AtomicBoolean();
+
     private ServerSocket server;
-    private final Map<String,Long> ipCooldown=new ConcurrentHashMap<>();
-    private final Set<String> wsBlacklist=ConcurrentHashMap.newKeySet();
-    private final Map<String,Long> dcCooldown=new ConcurrentHashMap<>();
-    private final CfDomains cf=new CfDomains();
+    private final Map<String, Long> endpointCooldown = new ConcurrentHashMap<>();
+    private final Map<String, Long> dcCooldown = new ConcurrentHashMap<>();
+    private final CfDomains cf = new CfDomains();
 
-    ProxyServer(ProxyConfig c,Log l){cfg=c;log=l;}
-
-    void start() throws Exception{
-        if(!running.compareAndSet(false,true))return;
-        cf.refresh();
-        server=new ServerSocket();
-        server.setReuseAddress(true);
-        server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"),cfg.port()));
-        log.add("Listening on 127.0.0.1:"+cfg.port());
-        log.add("Secret: "+cfg.secret());
-        exec.execute(()->{
-            while(running.get()){
-                try{Socket s=server.accept();exec.execute(()->handle(s));}
-                catch(Exception e){if(running.get())log.add("accept: "+e.getMessage());}
-            }
-        });
-        exec.execute(()->{while(running.get()){try{Thread.sleep(3600000);cf.refresh();}catch(Exception ignored){}}});
+    ProxyServer(ProxyConfig c, Log l) {
+        cfg = c;
+        log = l;
     }
 
-    void stop(){
+    void start() throws Exception {
+        if (!running.compareAndSet(false, true)) return;
+
+        cf.refresh();
+
+        server = new ServerSocket();
+        server.setReuseAddress(true);
+        server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), cfg.port()));
+        log.add("Listening on 127.0.0.1:" + cfg.port());
+        log.add("Secret: " + cfg.secret());
+
+        exec.execute(() -> {
+            while (running.get()) {
+                try {
+                    Socket s = server.accept();
+                    exec.execute(() -> handle(s));
+                } catch (Exception e) {
+                    if (running.get()) log.add("accept: " + e.getMessage());
+                }
+            }
+        });
+
+        exec.execute(() -> {
+            while (running.get()) {
+                try {
+                    Thread.sleep(3600000L);
+                    cf.refresh();
+                } catch (InterruptedException ignored) {
+                    return;
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    void stop() {
         running.set(false);
-        try{server.close();}catch(Exception ignored){}
+        try { if (server != null) server.close(); } catch (Exception ignored) {}
         exec.shutdownNow();
     }
 
-    private void handle(Socket client){
-        try(Socket c=client){
-            c.setTcpNoDelay(true);c.setSoTimeout(10000);
-            byte[] init=readFully(c.getInputStream(),64);
-            byte[] secret=Hex.decode(cfg.secret());
-            MtProto.Result r=MtProto.inspect(init,secret);
-            if(r==null){log.add("Bad MTProto handshake");return;}
-            int dc=r.dc; boolean media=r.media;
-            String target=Domains.DC_IP.get(dc);
-            if(target==null){log.add("DC"+dc+" has no target");return;}
-            int dcidx=media?-dc:dc;
-            byte[] relay=MtProto.relayInit(r.proto,dcidx);
-            MtProto.CryptoPair crypto=MtProto.crypto(r.clientPreIv,secret,relay);
+    private void handle(Socket client) {
+        try (Socket c = client) {
+            c.setTcpNoDelay(true);
+            c.setSoTimeout(10_000);
 
-            WsClient ws=null;
-            String key=dc+(media?"m":"");
-            String wsTarget = Domains.WS_IP.getOrDefault(dc, target);
-            if(System.currentTimeMillis()>=dcCooldown.getOrDefault(key,0L)){
-                List<String> ds=Domains.wsDomains(dc,media);
-                Collections.shuffle(ds);
+            byte[] init = readFully(c.getInputStream(), 64);
+            byte[] secret = Hex.decode(cfg.secret());
+            MtProto.Result r = MtProto.inspect(init, secret);
+            if (r == null) {
+                log.add("Bad MTProto handshake");
+                return;
+            }
 
-                for(String domain:ds){
-                    try{
-                        log.add("DC"+dc+(media?" media":"")+" -> "+domain+" via "+wsTarget);
+            int dc = r.dc;
+            boolean media = r.media;
+            String target = Domains.DC_IP.get(dc);
+            if (target == null) {
+                log.add("DC" + dc + " has no direct target");
+                return;
+            }
 
-                        ws = WsClient.connect(wsTarget, domain, "/apiws", 5000);
+            int dcidx = media ? -dc : dc;
+            byte[] relay = MtProto.relayInit(r.proto, dcidx);
+            MtProto.CryptoPair crypto = MtProto.crypto(r.clientPreIv, secret, relay);
 
-                        log.add("WS READY DC"+dc+(media?" media":"")+" -> "+domain);
-                        break;
+            String dcKey = dc + (media ? "m" : "");
+            long now = System.currentTimeMillis();
 
-                    }catch(Exception e){
-                        log.add("WS "+domain+" failed: "+e.getMessage());
+            // Direct WSS candidates. Each IP+hostname pair has its own
+            // cooldown. This prevents the same dead endpoint from being
+            // selected again immediately by the next Telegram connection.
+            if (now >= dcCooldown.getOrDefault(dcKey, 0L)) {
+                List<Domains.Endpoint> endpoints = new ArrayList<>(
+                        Domains.wsEndpoints(dc, media));
+                Collections.shuffle(endpoints);
+
+                for (Domains.Endpoint ep : endpoints) {
+                    if (isCooling(ep.key())) continue;
+
+                    WsClient ws = null;
+                    try {
+                        log.add("WS TRY DC" + dc + (media ? " media" : "")
+                                + " -> " + ep.host + " via " + ep.ip);
+
+                        ws = WsClient.connect(ep.ip, ep.host, "/apiws", CONNECT_TIMEOUT_MS);
+                        log.add("WS READY DC" + dc + " -> " + ep.host + " via " + ep.ip);
+
+                        ws.sendBinary(relay);
+                        bridge(c, ws, crypto);
+
+                        // A successful bridge means the endpoint actually
+                        // carried traffic, not merely returned HTTP 101.
+                        endpointCooldown.remove(ep.key());
+                        return;
+                    } catch (WsClient.WsCloseException e) {
+                        endpointCooldown.put(ep.key(),
+                                System.currentTimeMillis() + WS_FAIL_COOLDOWN_MS);
+                        log.add("WS BAD " + ep + ": close " + e.code
+                                + (e.reason.isEmpty() ? "" : " (" + e.reason + ")"));
+                    } catch (Exception e) {
+                        endpointCooldown.put(ep.key(),
+                                System.currentTimeMillis() + WS_FAIL_COOLDOWN_MS);
+                        log.add("WS BAD " + ep + ": " + safeMessage(e));
+                    } finally {
+                        if (ws != null) try { ws.close(); } catch (Exception ignored) {}
                     }
                 }
             }
 
-            if(ws!=null){
-                ws.sendBinary(relay);
-                bridge(c,ws,crypto);
-                return;
+            dcCooldown.put(dcKey, System.currentTimeMillis() + DC_FAIL_COOLDOWN_MS);
+            log.add("WS failed for DC" + dc + "; trying CF/direct fallback");
+
+            if (cfg.cf() && tryCf(c, dc, media, relay, crypto)) return;
+
+            try {
+                Socket up = new Socket();
+                up.connect(new InetSocketAddress(target, 443), CONNECT_TIMEOUT_MS);
+                up.setTcpNoDelay(true);
+                up.setSoTimeout(10_000);
+                up.getOutputStream().write(relay);
+                up.getOutputStream().flush();
+                log.add("DIRECT READY DC" + dc + " -> " + target);
+                bridgeTcp(c, up, crypto);
+            } catch (Exception e) {
+                log.add("DIRECT FAILED DC" + dc + ": " + safeMessage(e));
             }
-
-            log.add("WS failed for DC"+dc+"; trying CF/direct fallback");
-            if(tryCf(c,dc,media,relay,crypto))return;
-
-            Socket up=new Socket();
-            up.connect(new InetSocketAddress(target,443),5000);
-            up.setTcpNoDelay(true);
-            up.getOutputStream().write(relay);up.getOutputStream().flush();
-            bridgeTcp(c,up,crypto);
-        }catch(Exception e){log.add("client: "+e.getMessage());}
+        } catch (Exception e) {
+            log.add("client: " + safeMessage(e));
+        }
     }
 
-    private boolean tryCf(Socket client,int dc,boolean media,byte[] relay,MtProto.CryptoPair crypto){
-        ArrayList<String> ds=new ArrayList<>(cf.domains);
-        String custom=cfg.customCf();
-        if(!custom.isBlank())ds.addAll(Arrays.asList(custom.split("[,\\s]+")));
+    private boolean tryCf(Socket client, int dc, boolean media,
+                          byte[] relay, MtProto.CryptoPair crypto) {
+        ArrayList<String> ds = new ArrayList<>(cf.domains);
+        String custom = cfg.customCf();
+        if (!custom.isBlank()) ds.addAll(Arrays.asList(custom.split("[,\\s]+")));
         Collections.shuffle(ds);
-        for(String d:ds){
-            try{
-                WsClient w=WsClient.connect(d,d,media?"/apiws?dc="+dc:"/apiws?dc="+dc,5000);
-                w.sendBinary(relay);bridge(client,w,crypto);return true;
-            }catch(Exception e){log.add("CF "+d+" failed: "+e.getMessage());}
+
+        // Do not burn the entire list for one client. CF lists can be large.
+        int attempts = Math.min(ds.size(), 12);
+        for (int i = 0; i < attempts; i++) {
+            String d = ds.get(i);
+            WsClient w = null;
+            try {
+                String path = media ? "/apiws?dc=" + dc : "/apiws?dc=" + dc;
+                log.add("CF TRY " + d);
+                w = WsClient.connect(d, d, path, CONNECT_TIMEOUT_MS);
+                log.add("CF READY " + d);
+                w.sendBinary(relay);
+                bridge(client, w, crypto);
+                return true;
+            } catch (WsClient.WsCloseException e) {
+                log.add("CF BAD " + d + ": close " + e.code
+                        + (e.reason.isEmpty() ? "" : " (" + e.reason + ")"));
+            } catch (Exception e) {
+                log.add("CF BAD " + d + ": " + safeMessage(e));
+            } finally {
+                if (w != null) try { w.close(); } catch (Exception ignored) {}
+            }
         }
         return false;
     }
 
+    /**
+     * Bridges a single relay session.
+     *
+     * Important: clientDec is advanced exactly once per client chunk.
+     * The old implementation called clientDec.update() twice, consuming
+     * two AES-CTR blocks for one input buffer and corrupting the stream.
+     */
     private void bridge(Socket c, WsClient w, MtProto.CryptoPair x) throws Exception {
         InputStream ci = c.getInputStream();
         OutputStream co = c.getOutputStream();
-
-        AtomicBoolean stop = new AtomicBoolean(false);
+        AtomicBoolean stop = new AtomicBoolean();
 
         Thread clientToWs = new Thread(() -> {
             try {
-                byte[] buf = new byte[65536];
+                byte[] b = new byte[65536];
                 int n;
-
-                while (!stop.get() && (n = ci.read(buf)) != -1) {
-                    byte[] data = Arrays.copyOf(buf, n);
-
-                    byte[] decrypted = x.clientDec.update(data);
-                    if (decrypted == null || decrypted.length == 0)
-                        continue;
-
-                    byte[] encrypted = x.relayEnc.update(decrypted);
-                    if (encrypted == null || encrypted.length == 0)
-                        continue;
-
-                    w.sendBinary(encrypted);
+                while (!stop.get() && (n = ci.read(b)) != -1) {
+                    byte[] p = Arrays.copyOf(b, n);
+                    byte[] clientPlain = x.clientDec.update(p);
+                    byte[] relayData = x.relayEnc.update(clientPlain);
+                    if (relayData != null && relayData.length != 0) {
+                        w.sendBinary(relayData);
+                    }
                 }
-
             } catch (Exception e) {
-                if (!stop.get()) {
-                    log.add("client->WS: " + e.getMessage());
-                }
+                if (!stop.get()) log.add("client->WS: " + safeMessage(e));
             } finally {
                 stop.set(true);
             }
-        });
+        }, "tgws-client-ws");
 
         clientToWs.start();
-
         try {
             while (!stop.get()) {
-                byte[] data = w.readBinary();
+                byte[] p = w.readBinary();
+                byte[] relayPlain = x.relayDec.update(p);
+                if (relayPlain == null || relayPlain.length == 0) continue;
 
-                if (data == null || data.length == 0)
-                    continue;
-
-                byte[] decrypted = x.relayDec.update(data);
-                if (decrypted == null || decrypted.length == 0)
-                    continue;
-
-                byte[] encrypted = x.clientEnc.update(decrypted);
-                if (encrypted == null || encrypted.length == 0)
-                    continue;
-
-                co.write(encrypted);
-                co.flush();
-            }
-
-        } catch (Exception e) {
-            if (!stop.get()) {
-                log.add("WS->client: " + e.getMessage());
+                byte[] clientData = x.clientEnc.update(relayPlain);
+                if (clientData != null && clientData.length != 0) {
+                    co.write(clientData);
+                    co.flush();
+                }
             }
         } finally {
             stop.set(true);
             clientToWs.interrupt();
-
-            try {
-                w.close();
-            } catch (Exception ignored) {
-            }
+            try { w.close(); } catch (Exception ignored) {}
         }
     }
 
@@ -184,53 +247,79 @@ final class ProxyServer {
         InputStream ci = c.getInputStream(), ui = u.getInputStream();
         OutputStream co = c.getOutputStream(), uo = u.getOutputStream();
 
+        AtomicBoolean stop = new AtomicBoolean();
+
         Thread a = new Thread(() -> {
             try {
                 byte[] buf = new byte[65536];
                 int n;
-                while ((n = ci.read(buf)) != -1) {
+                while (!stop.get() && (n = ci.read(buf)) != -1) {
                     byte[] data = Arrays.copyOf(buf, n);
                     byte[] encrypted = x.relayEnc.update(x.clientDec.update(data));
-                    if (encrypted != null) {
+                    if (encrypted != null && encrypted.length != 0) {
                         uo.write(encrypted);
                         uo.flush();
                     }
                 }
-            } catch (Exception ignored) {
-                // можно логировать при необходимости
+            } catch (Exception e) {
+                if (!stop.get()) log.add("client->TCP: " + safeMessage(e));
+            } finally {
+                stop.set(true);
             }
-        });
+        }, "tgws-client-tcp");
 
         Thread b = new Thread(() -> {
             try {
                 byte[] buf = new byte[65536];
                 int n;
-                while ((n = ui.read(buf)) != -1) {
+                while (!stop.get() && (n = ui.read(buf)) != -1) {
                     byte[] data = Arrays.copyOf(buf, n);
                     byte[] decrypted = x.relayDec.update(data);
-                    if (decrypted == null) return; // или continue, зависит от реализации Cipher
+                    if (decrypted == null || decrypted.length == 0) continue;
+
                     byte[] encryptedForClient = x.clientEnc.update(decrypted);
-                    if (encryptedForClient != null) {
+                    if (encryptedForClient != null && encryptedForClient.length != 0) {
                         co.write(encryptedForClient);
                         co.flush();
                     }
                 }
-            } catch (Exception ignored) {
-                // можно логировать при необходимости
+            } catch (Exception e) {
+                if (!stop.get()) log.add("TCP->client: " + safeMessage(e));
             } finally {
-                try { co.close(); } catch (Exception ignored2) {}
+                stop.set(true);
+                try { co.close(); } catch (Exception ignored) {}
             }
-        });
+        }, "tgws-tcp-client");
 
         a.start();
         b.start();
         a.join();
         b.join();
-        u.close();
+        try { u.close(); } catch (Exception ignored) {}
     }
 
+    private boolean isCooling(String key) {
+        long until = endpointCooldown.getOrDefault(key, 0L);
+        if (until <= System.currentTimeMillis()) {
+            endpointCooldown.remove(key, until);
+            return false;
+        }
+        return true;
+    }
 
-    private static byte[] readFully(InputStream in,int n)throws Exception{
-        byte[] b=new byte[n];int p=0;while(p<n){int k=in.read(b,p,n-p);if(k<0)throw new EOFException();p+=k;}return b;
+    private static String safeMessage(Throwable t) {
+        String m = t.getMessage();
+        return m == null || m.isEmpty() ? t.getClass().getSimpleName() : m;
+    }
+
+    private static byte[] readFully(InputStream in, int n) throws Exception {
+        byte[] b = new byte[n];
+        int p = 0;
+        while (p < n) {
+            int k = in.read(b, p, n - p);
+            if (k < 0) throw new EOFException();
+            p += k;
+        }
+        return b;
     }
 }

@@ -4,226 +4,289 @@ import javax.net.ssl.*;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.*;
-import java.nio.charset.StandardCharsets;
 
+/**
+ * Small RFC 6455 binary WebSocket client used by the proxy.
+ *
+ * Telegram is the server, therefore client-to-server frames are masked.
+ * Incoming frames are not expected to be masked, but masked frames are
+ * accepted for robustness.
+ */
 final class WsClient implements Closeable {
+    private static final byte[] WS_GUID =
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11".getBytes(StandardCharsets.US_ASCII);
+
     private final SSLSocket ssl;
     private final InputStream in;
     private final OutputStream out;
-    private final boolean masked = true;
+    private final ByteArrayOutputStream fragmented = new ByteArrayOutputStream();
+    private int fragmentedOpcode = -1;
+    private boolean closed;
 
     private WsClient(SSLSocket s, InputStream input) throws Exception {
-        ssl=s; in=input; out=s.getOutputStream();
+        ssl = s;
+        in = input;
+        out = s.getOutputStream();
     }
 
-    static WsClient connect(String ip,String host,String path,int timeout) throws Exception {
-        Socket raw=new Socket();
-        raw.connect(new InetSocketAddress(ip,443),timeout);
-        raw.setTcpNoDelay(true);
-        raw.setSoTimeout(0);
-        SSLContext ctx=SSLContext.getInstance("TLS");
-        ctx.init(null,null,new SecureRandom());
-        SSLSocket s=(SSLSocket)ctx.getSocketFactory().createSocket(raw,host,443,true);
-        SSLParameters p=s.getSSLParameters();
-        p.setEndpointIdentificationAlgorithm(null);
-        p.setServerNames(Collections.singletonList(new SNIHostName(host)));
-        s.setSSLParameters(p);
-        s.setSoTimeout(timeout);
-        s.startHandshake();
+    static WsClient connect(String ip, String host, String path, int timeout) throws Exception {
+        Socket raw = new Socket();
+        try {
+            raw.connect(new InetSocketAddress(ip, 443), timeout);
+            raw.setTcpNoDelay(true);
 
-        String key=Base64.getEncoder().encodeToString(Hex.random(16));
+            SSLContext ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, null, new SecureRandom());
 
-        String req=
-                "GET "+path+" HTTP/1.1\r\n"+
-                        "Host: "+host+"\r\n"+
-                        "Upgrade: websocket\r\n"+
-                        "Connection: Upgrade\r\n"+
-                        "Sec-WebSocket-Key: "+key+"\r\n"+
-                        "Sec-WebSocket-Version: 13\r\n"+
-                        "Sec-WebSocket-Protocol: binary\r\n"+
-                        "\r\n";
+            SSLSocket s = (SSLSocket) ctx.getSocketFactory().createSocket(raw, host, 443, true);
+            SSLParameters p = s.getSSLParameters();
+            // We connect to a fixed IP while using Telegram's hostname as SNI.
+            // Default certificate/chain validation remains enabled.
+            p.setEndpointIdentificationAlgorithm(null);
+            p.setServerNames(Collections.singletonList(new SNIHostName(host)));
+            s.setSSLParameters(p);
+            s.setSoTimeout(timeout);
+            s.startHandshake();
 
-        s.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
-        s.getOutputStream().flush();
+            String key = Base64.getEncoder().encodeToString(random16());
+            String req = "GET " + path + " HTTP/1.1\r\n" +
+                    "Host: " + host + "\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Key: " + key + "\r\n" +
+                    "Sec-WebSocket-Version: 13\r\n" +
+                    "\r\n";
 
-        BufferedInputStream bin=
-                new BufferedInputStream(s.getInputStream(),8192);
+            OutputStream sout = s.getOutputStream();
+            sout.write(req.getBytes(StandardCharsets.US_ASCII));
+            sout.flush();
 
-        String status=readLine(bin);
-
-        if(status==null)
-            throw new EOFException("WS handshake: EOF");
-
-        if(!status.startsWith("HTTP/1.1 101"))
-            throw new IOException("WS handshake: "+status);
-        System.out.println("WS 101: " + host + path);
-        System.out.println("WS READY: " + host + path);
-
-        boolean binaryProtocol=false;
-
-        while(true){
-            String l=readLine(bin);
-
-            if(l==null)
-                throw new EOFException("WS handshake: EOF");
-
-            if(l.isEmpty())
-                break;
-
-            if(l.regionMatches(true,0,
-                    "Sec-WebSocket-Protocol:",0,
-                    "Sec-WebSocket-Protocol:".length())){
-
-                if(l.toLowerCase(Locale.US).contains("binary"))
-                    binaryProtocol=true;
+            BufferedInputStream bin = new BufferedInputStream(s.getInputStream(), 8192);
+            String status = readLine(bin);
+            if (status == null || !status.startsWith("HTTP/1.1 101")) {
+                throw new IOException("WS handshake: " + status);
             }
+
+            Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+            while (true) {
+                String line = readLine(bin);
+                if (line == null) throw new EOFException("WS handshake EOF");
+                if (line.isEmpty()) break;
+                int colon = line.indexOf(':');
+                if (colon > 0) {
+                    headers.put(line.substring(0, colon).trim(),
+                            line.substring(colon + 1).trim());
+                }
+            }
+
+            String upgrade = headers.get("Upgrade");
+            if (upgrade == null || !"websocket".equalsIgnoreCase(upgrade)) {
+                throw new IOException("WS handshake: missing Upgrade");
+            }
+
+            String accept = headers.get("Sec-WebSocket-Accept");
+            String expected = Base64.getEncoder().encodeToString(
+                    MessageDigest.getInstance("SHA-1").digest(concat(
+                            key.getBytes(StandardCharsets.US_ASCII), WS_GUID)));
+            if (accept == null || !expected.equals(accept.trim())) {
+                throw new IOException("WS handshake: bad Sec-WebSocket-Accept");
+            }
+
+            return new WsClient(s, bin);
+        } catch (Exception e) {
+            try { raw.close(); } catch (Exception ignored) {}
+            throw e;
+        }
+    }
+
+    void sendBinary(byte[] data) throws Exception {
+        sendFrame(0x2, data);
+    }
+
+    private synchronized void sendFrame(int opcode, byte[] data) throws Exception {
+        if (closed) throw new EOFException("WS closed");
+        int len = data.length;
+        out.write(0x80 | (opcode & 0x0f));
+
+        if (len < 126) {
+            out.write(0x80 | len);
+        } else if (len <= 0xffff) {
+            out.write(0x80 | 126);
+            out.write((len >>> 8) & 0xff);
+            out.write(len & 0xff);
+        } else {
+            out.write(0x80 | 127);
+            long n = len & 0xffffffffL;
+            for (int i = 7; i >= 0; i--) out.write((int) (n >>> (8 * i)) & 0xff);
         }
 
-        if(!binaryProtocol)
-            throw new IOException("WS handshake: server did not select binary protocol");
-        s.setSoTimeout(0);
-        return new WsClient(s,bin);
-    }
-
-    void sendBinary(byte[] data)throws Exception{
-        int len=data.length; out.write(0x82);
-        if(len<126){out.write(0x80|len);}
-        else if(len<=65535){out.write(0x80|126);out.write((len>>>8)&255);out.write(len&255);}
-        else {out.write(0x80|127);for(int i=7;i>=0;i--)out.write((len >>> (8*i))&255);}
-        byte[] mask=Hex.random(4);out.write(mask);
-        for(int i=0;i<len;i++)out.write(data[i]^mask[i&3]);
+        byte[] mask = Hex.random(4);
+        out.write(mask);
+        for (int i = 0; i < len; i++) out.write(data[i] ^ mask[i & 3]);
         out.flush();
     }
 
     byte[] readBinary() throws Exception {
         while (true) {
-            int b1 = in.read();
-            if (b1 < 0)
-                throw new EOFException("WS EOF");
+            Frame f = readFrame();
 
-            int b2 = in.read();
-            if (b2 < 0)
-                throw new EOFException("WS EOF");
-
-            int opcode = b1 & 0x0f;
-            boolean fin = (b1 & 0x80) != 0;
-
-            long len = b2 & 0x7f;
-
-            if (len == 126) {
-                int a = in.read();
-                int b = in.read();
-
-                if (a < 0 || b < 0)
-                    throw new EOFException("WS EOF");
-
-                len = ((a & 0xffL) << 8) | (b & 0xffL);
-
-            } else if (len == 127) {
-                len = 0;
-
-                for (int i = 0; i < 8; i++) {
-                    int x = in.read();
-
-                    if (x < 0)
-                        throw new EOFException("WS EOF");
-
-                    len = (len << 8) | (x & 0xffL);
-                }
-            }
-
-            boolean mask = (b2 & 0x80) != 0;
-
-            if (len > 16 * 1024 * 1024)
-                throw new IOException("WS frame too large: " + len);
-
-            byte[] maskKey = null;
-
-            if (mask) {
-                maskKey = in.readNBytes(4);
-
-                if (maskKey.length != 4)
-                    throw new EOFException("WS mask EOF");
-            }
-
-            byte[] data = in.readNBytes((int) len);
-
-            if (data.length != (int) len)
-                throw new EOFException("WS payload EOF");
-
-            if (mask) {
-                for (int i = 0; i < data.length; i++) {
-                    data[i] ^= maskKey[i & 3];
-                }
-            }
-
-            // CLOSE
-            if (opcode == 8) {
-                int code = -1;
+            if (f.opcode == 0x8) {
+                int code = 1000;
                 String reason = "";
-
-                if (data.length >= 2) {
-                    code = ((data[0] & 0xff) << 8)
-                            | (data[1] & 0xff);
-
-                    if (data.length > 2) {
-                        reason = new String(
-                                data,
-                                2,
-                                data.length - 2,
-                                StandardCharsets.UTF_8
-                        );
+                if (f.payload.length >= 2) {
+                    code = ((f.payload[0] & 0xff) << 8) | (f.payload[1] & 0xff);
+                    if (f.payload.length > 2) {
+                        reason = new String(f.payload, 2, f.payload.length - 2,
+                                StandardCharsets.UTF_8);
                     }
                 }
-
-                // Ответить CLOSE, если сервер сам его прислал.
                 try {
-                    sendControl(8, data);
-                } catch (Exception ignored) {
+                    sendClose(f.payload);
+                } catch (Exception ignored) {}
+                throw new WsCloseException(code, reason);
+            }
+
+            if (f.opcode == 0x9) { // ping
+                sendControl(0xA, f.payload);
+                continue;
+            }
+            if (f.opcode == 0xA) continue; // pong
+
+            if (f.opcode == 0x2) {
+                if (f.fin) return f.payload;
+                fragmented.reset();
+                fragmentedOpcode = 0x2;
+                fragmented.write(f.payload);
+                continue;
+            }
+
+            if (f.opcode == 0x0) {
+                if (fragmentedOpcode != 0x2) {
+                    throw new IOException("WS unexpected continuation");
                 }
-
-                throw new EOFException(
-                        "WS close code=" + code +
-                                " reason=" + reason
-                );
-            }
-
-            // PING
-            if (opcode == 9) {
-                sendControl(10, data);
+                fragmented.write(f.payload);
+                if (f.fin) {
+                    byte[] result = fragmented.toByteArray();
+                    fragmented.reset();
+                    fragmentedOpcode = -1;
+                    return result;
+                }
                 continue;
             }
 
-            // PONG
-            if (opcode == 10) {
-                continue;
-            }
-
-            // Binary
-            if (opcode == 2) {
-                return data;
-            }
-
-            // Continuation
-            if (opcode == 0) {
-                return data;
-            }
-
-            // Text/прочие кадры игнорируем.
+            throw new IOException("WS unsupported opcode=" + f.opcode);
         }
     }
 
-    private void sendControl(int opcode,byte[]d)throws Exception{
-        out.write(0x80|opcode);out.write(d.length);out.write(d);out.flush();
+    private Frame readFrame() throws Exception {
+        int b1 = in.read();
+        int b2 = in.read();
+        if (b1 < 0 || b2 < 0) throw new EOFException("WS EOF");
+
+        boolean fin = (b1 & 0x80) != 0;
+        int opcode = b1 & 0x0f;
+        long len = b2 & 0x7f;
+
+        if (len == 126) {
+            len = ((in.read() & 0xffL) << 8) | (in.read() & 0xffL);
+        } else if (len == 127) {
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | (in.read() & 0xffL);
+            if (len < 0) throw new IOException("WS invalid length");
+        }
+
+        boolean masked = (b2 & 0x80) != 0;
+        if ((opcode & 0x8) != 0 && (!fin || len > 125)) {
+            throw new IOException("WS invalid control frame");
+        }
+        if (len > 16L * 1024L * 1024L) {
+            throw new IOException("WS frame too large: " + len);
+        }
+
+        byte[] mask = masked ? readFully(in, 4) : null;
+        byte[] payload = readFully(in, (int) len);
+        if (masked) {
+            for (int i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+        }
+        return new Frame(fin, opcode, payload);
     }
-    private static String readLine(InputStream in)throws Exception{
-        ByteArrayOutputStream b=new ByteArrayOutputStream();int c,prev=-1;
-        while((c=in.read())!=-1){if(prev=='\r'&&c=='\n'){byte[]x=b.toByteArray();return new String(x,0,x.length-1,StandardCharsets.ISO_8859_1);}b.write(c);prev=c;}
+
+    private void sendControl(int opcode, byte[] data) throws Exception {
+        if (data.length > 125) throw new IOException("WS control payload too large");
+        synchronized (this) {
+            out.write(0x80 | opcode);
+            out.write(data.length); // server-to-client control frames are unmasked
+            out.write(data);
+            out.flush();
+        }
+    }
+
+    private void sendClose(byte[] payload) throws Exception {
+        if (closed) return;
+        closed = true;
+        sendControl(0x8, payload.length <= 125 ? payload : new byte[]{});
+    }
+
+    @Override public void close() {
+        closed = true;
+        try { ssl.close(); } catch (Exception ignored) {}
+    }
+
+    static final class WsCloseException extends IOException {
+        final int code;
+        final String reason;
+        WsCloseException(int code, String reason) {
+            super("WS close code=" + code + " reason=" + reason);
+            this.code = code;
+            this.reason = reason;
+        }
+    }
+
+    private static final class Frame {
+        final boolean fin;
+        final int opcode;
+        final byte[] payload;
+        Frame(boolean fin, int opcode, byte[] payload) {
+            this.fin = fin; this.opcode = opcode; this.payload = payload;
+        }
+    }
+
+    private static byte[] random16() {
+        return Hex.random(16);
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] r = new byte[a.length + b.length];
+        System.arraycopy(a, 0, r, 0, a.length);
+        System.arraycopy(b, 0, r, a.length, b.length);
+        return r;
+    }
+
+    private static byte[] readFully(InputStream in, int n) throws Exception {
+        byte[] b = new byte[n];
+        int p = 0;
+        while (p < n) {
+            int k = in.read(b, p, n - p);
+            if (k < 0) throw new EOFException();
+            p += k;
+        }
+        return b;
+    }
+
+    private static String readLine(InputStream in) throws Exception {
+        ByteArrayOutputStream b = new ByteArrayOutputStream();
+        int c, prev = -1;
+        while ((c = in.read()) != -1) {
+            if (prev == '\r' && c == '\n') {
+                byte[] x = b.toByteArray();
+                return new String(x, 0, x.length - 1, StandardCharsets.ISO_8859_1);
+            }
+            b.write(c);
+            prev = c;
+        }
         return null;
     }
-    InputStream rawIn(){return in;}
-    OutputStream rawOut(){return out;}
-    public void close(){try{ssl.close();}catch(Exception ignored){}}
 }
