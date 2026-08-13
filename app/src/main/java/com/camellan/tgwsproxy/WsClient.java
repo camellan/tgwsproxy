@@ -6,6 +6,7 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.util.*;
+import java.nio.charset.StandardCharsets;
 
 final class WsClient implements Closeable {
     private final SSLSocket ssl;
@@ -96,19 +97,122 @@ final class WsClient implements Closeable {
         out.flush();
     }
 
-    byte[] readBinary()throws Exception{
-        int b1=in.read(); int b2=in.read(); if(b2<0)throw new EOFException();
-        int opcode=b1&15; boolean fin=(b1&0x80)!=0;
-        long len=b2&127; if(len==126)len=((in.read()&255)<<8)|(in.read()&255);
-        else if(len==127){len=0;for(int i=0;i<8;i++)len=(len<<8)|(in.read()&255);}
-        boolean mask=(b2&0x80)!=0; byte[] mk=mask?in.readNBytes(4):null;
-        if(len>16*1024*1024)throw new IOException("WS frame too large");
-        byte[] d=in.readNBytes((int)len); if(d.length!=len)throw new EOFException();
-        if(mask)for(int i=0;i<d.length;i++)d[i]^=mk[i&3];
-        if(opcode==8)throw new EOFException("WS close");
-        if(opcode==9){sendControl(10,d);return readBinary();}
-        if(opcode!=2 && opcode!=0) return readBinary();
-        return d;
+    byte[] readBinary() throws Exception {
+        while (true) {
+            int b1 = in.read();
+            if (b1 < 0)
+                throw new EOFException("WS EOF");
+
+            int b2 = in.read();
+            if (b2 < 0)
+                throw new EOFException("WS EOF");
+
+            int opcode = b1 & 0x0f;
+            boolean fin = (b1 & 0x80) != 0;
+
+            long len = b2 & 0x7f;
+
+            if (len == 126) {
+                int a = in.read();
+                int b = in.read();
+
+                if (a < 0 || b < 0)
+                    throw new EOFException("WS EOF");
+
+                len = ((a & 0xffL) << 8) | (b & 0xffL);
+
+            } else if (len == 127) {
+                len = 0;
+
+                for (int i = 0; i < 8; i++) {
+                    int x = in.read();
+
+                    if (x < 0)
+                        throw new EOFException("WS EOF");
+
+                    len = (len << 8) | (x & 0xffL);
+                }
+            }
+
+            boolean mask = (b2 & 0x80) != 0;
+
+            if (len > 16 * 1024 * 1024)
+                throw new IOException("WS frame too large: " + len);
+
+            byte[] maskKey = null;
+
+            if (mask) {
+                maskKey = in.readNBytes(4);
+
+                if (maskKey.length != 4)
+                    throw new EOFException("WS mask EOF");
+            }
+
+            byte[] data = in.readNBytes((int) len);
+
+            if (data.length != (int) len)
+                throw new EOFException("WS payload EOF");
+
+            if (mask) {
+                for (int i = 0; i < data.length; i++) {
+                    data[i] ^= maskKey[i & 3];
+                }
+            }
+
+            // CLOSE
+            if (opcode == 8) {
+                int code = -1;
+                String reason = "";
+
+                if (data.length >= 2) {
+                    code = ((data[0] & 0xff) << 8)
+                            | (data[1] & 0xff);
+
+                    if (data.length > 2) {
+                        reason = new String(
+                                data,
+                                2,
+                                data.length - 2,
+                                StandardCharsets.UTF_8
+                        );
+                    }
+                }
+
+                // Ответить CLOSE, если сервер сам его прислал.
+                try {
+                    sendControl(8, data);
+                } catch (Exception ignored) {
+                }
+
+                throw new EOFException(
+                        "WS close code=" + code +
+                                " reason=" + reason
+                );
+            }
+
+            // PING
+            if (opcode == 9) {
+                sendControl(10, data);
+                continue;
+            }
+
+            // PONG
+            if (opcode == 10) {
+                continue;
+            }
+
+            // Binary
+            if (opcode == 2) {
+                return data;
+            }
+
+            // Continuation
+            if (opcode == 0) {
+                return data;
+            }
+
+            // Text/прочие кадры игнорируем.
+        }
     }
 
     private void sendControl(int opcode,byte[]d)throws Exception{

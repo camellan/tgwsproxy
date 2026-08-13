@@ -110,28 +110,74 @@ final class ProxyServer {
         return false;
     }
 
-    private void bridge(Socket c,WsClient w,MtProto.CryptoPair x)throws Exception{
-        InputStream ci=c.getInputStream();OutputStream co=c.getOutputStream();
-        AtomicBoolean stop=new AtomicBoolean();
-        Thread a=new Thread(()->{
-            try{
-                byte[] b=new byte[65536];int n;
-                while(!stop.get()&&(n=ci.read(b))!=-1){
-                    byte[] p=Arrays.copyOf(b,n);
-                    byte[] decrypted=x.clientDec.update(p);
-                    byte[] relay=x.relayEnc.update(decrypted);
-                    w.sendBinary(relay);
+    private void bridge(Socket c, WsClient w, MtProto.CryptoPair x) throws Exception {
+        InputStream ci = c.getInputStream();
+        OutputStream co = c.getOutputStream();
+
+        AtomicBoolean stop = new AtomicBoolean(false);
+
+        Thread clientToWs = new Thread(() -> {
+            try {
+                byte[] buf = new byte[65536];
+                int n;
+
+                while (!stop.get() && (n = ci.read(buf)) != -1) {
+                    byte[] data = Arrays.copyOf(buf, n);
+
+                    byte[] decrypted = x.clientDec.update(data);
+                    if (decrypted == null || decrypted.length == 0)
+                        continue;
+
+                    byte[] encrypted = x.relayEnc.update(decrypted);
+                    if (encrypted == null || encrypted.length == 0)
+                        continue;
+
+                    w.sendBinary(encrypted);
                 }
-            }catch(Exception ignored){}finally{stop.set(true);}
-        });
-        a.start();
-        try{
-            while(!stop.get()){
-                byte[] p=w.readBinary();
-                byte[] client=x.clientEnc.update(x.relayDec.update(p));
-                co.write(client);co.flush();
+
+            } catch (Exception e) {
+                if (!stop.get()) {
+                    log.add("client->WS: " + e.getMessage());
+                }
+            } finally {
+                stop.set(true);
             }
-        }finally{stop.set(true);a.interrupt();w.close();}
+        });
+
+        clientToWs.start();
+
+        try {
+            while (!stop.get()) {
+                byte[] data = w.readBinary();
+
+                if (data == null || data.length == 0)
+                    continue;
+
+                byte[] decrypted = x.relayDec.update(data);
+                if (decrypted == null || decrypted.length == 0)
+                    continue;
+
+                byte[] encrypted = x.clientEnc.update(decrypted);
+                if (encrypted == null || encrypted.length == 0)
+                    continue;
+
+                co.write(encrypted);
+                co.flush();
+            }
+
+        } catch (Exception e) {
+            if (!stop.get()) {
+                log.add("WS->client: " + e.getMessage());
+            }
+        } finally {
+            stop.set(true);
+            clientToWs.interrupt();
+
+            try {
+                w.close();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     private void bridgeTcp(Socket c, Socket u, MtProto.CryptoPair x) throws Exception {
