@@ -4,6 +4,8 @@ import android.app.*;
 import android.content.*;
 import android.os.*;
 import android.text.InputType;
+import android.text.method.ScrollingMovementMethod;
+import android.util.TypedValue;
 import android.view.*;
 import android.widget.*;
 import java.util.*;
@@ -40,7 +42,11 @@ public class MainActivity extends Activity {
 
         root.addView(logRow);
 
-        logs=new TextView(this);logs.setTextSize(11);ScrollView sv=new ScrollView(this);sv.addView(logs);root.addView(sv,new LinearLayout.LayoutParams(-1,0,1));
+        logs=new TextView(this);
+        configureLogsTextView();
+
+        ScrollView sv=new ScrollView(this);
+        sv.addView(logs);root.addView(sv,new LinearLayout.LayoutParams(-1,0,1));
         setContentView(root);
 
         start.setOnClickListener(v->startProxy());
@@ -58,6 +64,18 @@ public class MainActivity extends Activity {
             Toast.makeText(this,"Лог очищен",Toast.LENGTH_SHORT).show();
         });
         refresh();
+    }
+
+    private void configureLogsTextView() {
+        logs.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        logs.setHorizontallyScrolling(false);
+        logs.setMovementMethod(new ScrollingMovementMethod());
+
+        // Это разрешает выделение
+        logs.setTextIsSelectable(true);
+
+        logs.setFocusable(true);
+        logs.setFocusableInTouchMode(true);
     }
 
     void startProxy(){
