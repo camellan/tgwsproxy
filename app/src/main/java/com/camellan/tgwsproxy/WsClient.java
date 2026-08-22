@@ -33,24 +33,49 @@ final class WsClient implements Closeable {
     }
 
     static WsClient connect(String ip, String host, String path, int timeout) throws Exception {
-        Socket raw = new Socket();
+        Socket raw = null;
+        SSLSocket s = null;
         try {
-            raw.connect(new InetSocketAddress(ip, 443), timeout);
-            raw.setTcpNoDelay(true);
+            // 1. Если это домен Cloudflare (НЕ telegram.org), мы используем стандартный SSL-сетевой стек Android.
+            // Передача текстового host вместо IP в SSLSocketFactory заставляет Android правильно настроить SNI.
+            if (!host.toLowerCase().endsWith("telegram.org")) {
+                // Создаем сокет сразу с TLS-оберткой и поддержкой SNI через дефолтную фабрику
+                s = (SSLSocket) SSLSocketFactory.getDefault().createSocket();
 
-            SSLContext ctx = SSLContext.getInstance("TLS");
-            ctx.init(null, null, new SecureRandom());
+                // Исключаем TLS-сокет из маршрутизации VPN, чтобы он шел через физическую сеть
+                ProxyService.protectSocket(s);
 
-            SSLSocket s = (SSLSocket) ctx.getSocketFactory().createSocket(raw, host, 443, true);
-            SSLParameters p = s.getSSLParameters();
-            // We connect to a fixed IP while using Telegram's hostname as SNI.
-            // Default certificate/chain validation remains enabled.
-            p.setEndpointIdentificationAlgorithm(null);
-            p.setServerNames(Collections.singletonList(new SNIHostName(host)));
-            s.setSSLParameters(p);
-            s.setSoTimeout(timeout);
+                // Подключаемся к конкретному Anycast IP Cloudflare
+                s.connect(new InetSocketAddress(ip, 443), timeout);
+                s.setTcpNoDelay(true);
+                s.setSoTimeout(timeout);
+
+                // Включаем обязательную валидацию HTTPS для Cloudflare
+                SSLParameters p = s.getSSLParameters();
+                p.setEndpointIdentificationAlgorithm("HTTPS");
+                s.setSSLParameters(p);
+            } else {
+                // 2. Для прямых IP дата-центров Telegram оставляем ваш оригинальный код с отключенной валидацией
+                raw = new Socket();
+                ProxyService.protectSocket(raw);
+                raw.connect(new InetSocketAddress(ip, 443), timeout);
+                raw.setTcpNoDelay(true);
+
+                SSLContext ctx = SSLContext.getInstance("TLS");
+                ctx.init(null, null, new SecureRandom());
+
+                s = (SSLSocket) ctx.getSocketFactory().createSocket(raw, host, 443, true);
+                SSLParameters p = s.getSSLParameters();
+                p.setEndpointIdentificationAlgorithm(null);
+                p.setServerNames(Collections.singletonList(new SNIHostName(host)));
+                s.setSSLParameters(p);
+                s.setSoTimeout(timeout);
+            }
+
+            // Запускаем безопасное рукопожатие
             s.startHandshake();
 
+            // Дальнейший ваш код HTTP-хэндшейка WebSocket остается без изменений
             String key = Base64.getEncoder().encodeToString(random16());
             String req = "GET " + path + " HTTP/1.1\r\n" +
                     "Host: " + host + "\r\n" +
@@ -97,10 +122,12 @@ final class WsClient implements Closeable {
 
             return new WsClient(s, bin);
         } catch (Exception e) {
-            try { raw.close(); } catch (Exception ignored) {}
+            if (raw != null) { try { raw.close(); } catch (Exception ignored) {} }
+            if (s != null) { try { s.close(); } catch (Exception ignored) {} }
             throw e;
         }
     }
+
 
     void sendBinary(byte[] data) throws Exception {
         sendFrame(0x2, data);

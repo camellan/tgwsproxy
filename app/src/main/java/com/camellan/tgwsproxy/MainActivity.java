@@ -2,6 +2,7 @@ package com.camellan.tgwsproxy;
 
 import android.app.*;
 import android.content.*;
+import android.net.VpnService; // <-- Добавлен импорт
 import android.os.*;
 import android.text.InputType;
 import android.text.method.ScrollingMovementMethod;
@@ -11,6 +12,8 @@ import android.widget.*;
 import java.util.*;
 
 public class MainActivity extends Activity {
+    private static final int REQ_CODE_VPN = 100; // <-- Код запроса для VPN диалога
+
     ProxyConfig cfg;
     EditText secret,port;
     TextView status,logs;
@@ -70,10 +73,7 @@ public class MainActivity extends Activity {
         logs.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         logs.setHorizontallyScrolling(false);
         logs.setMovementMethod(new ScrollingMovementMethod());
-
-        // Это разрешает выделение
         logs.setTextIsSelectable(true);
-
         logs.setFocusable(true);
         logs.setFocusableInTouchMode(true);
     }
@@ -85,12 +85,60 @@ public class MainActivity extends Activity {
         int p;
         try{p=Integer.parseInt(port.getText().toString());}catch(Exception e){p=1443;}
         cfg.setSecret(s);cfg.setPort(p);
+
         if(Build.VERSION.SDK_INT>=33)requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},99);
-        startForegroundService(new Intent(this,ProxyService.class));
-        status.setText("Запущен на 127.0.0.1:"+p);
-        Toast.makeText(this,"Прокси запущен",Toast.LENGTH_SHORT).show();
+
+        // 1. Проверяем, подготовлено ли системное разрешение для VPN
+        Intent vpnIntent = VpnService.prepare(this);
+        if (vpnIntent != null) {
+            // Разрешения еще нет — показываем системный диалог Android
+            startActivityForResult(vpnIntent, REQ_CODE_VPN);
+        } else {
+            // Разрешение уже есть — сразу запускаем сервис
+            runProxyService(p);
+        }
     }
-    void stopProxy(){stopService(new Intent(this,ProxyService.class));status.setText("Остановлен");}
+
+    // 2. Обрабатываем ответ пользователя из системного диалога VPN
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_CODE_VPN) {
+            if (resultCode == RESULT_OK) {
+                // Пользователь нажал "ОК" — запускаем сервис
+                int p;
+                try{p=Integer.parseInt(port.getText().toString());}catch(Exception e){p=1443;}
+                runProxyService(p);
+            } else {
+                // Пользователь отклонил запрос
+                Toast.makeText(this, "Разрешение отменено. TUN режим не может быть запущен.", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    // Вынесли фактический запуск сервиса в отдельный метод, чтобы не дублировать код
+    private void runProxyService(int p) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(new Intent(this, ProxyService.class));
+        } else {
+            startService(new Intent(this, ProxyService.class));
+        }
+        status.setText("Запущен в режиме VPN / TUN");
+        Toast.makeText(this, "Прокси запущен", Toast.LENGTH_SHORT).show();
+    }
+
+    //void stopProxy(){stopService(new Intent(this,ProxyService.class));status.setText("Остановлен");}
+    void stopProxy() {
+        // Создаем интент, указывающий на наш сервис, и добавляем экшен остановки
+        Intent stopIntent = new Intent(this, ProxyService.class);
+        stopIntent.setAction(ProxyService.ACTION_STOP);
+
+        // Отправляем интент в сервис (в Android 8.0+ это безопасно делать через startService, если приложение на переднем плане)
+        startService(stopIntent);
+
+        status.setText("Остановлен");
+        Toast.makeText(this, "VPN отключен", Toast.LENGTH_SHORT).show();
+    }
     void refresh(){logs.setText(LogStore.get(this));}
     @Override protected void onResume(){super.onResume();refresh();}
 }
